@@ -62,7 +62,7 @@ public class ImageCache {
     private static final int DEFAULT_DISK_CACHE_SIZE = 1024 * 1024 * 10; // 10MB
 
     // Compression settings when writing images to disk cache
-    private static final CompressFormat DEFAULT_COMPRESS_FORMAT = CompressFormat.JPEG;
+    private static final CompressFormat DEFAULT_COMPRESS_FORMAT = CompressFormat.PNG;
     private static final int DEFAULT_COMPRESS_QUALITY = 90;
     private static final int DISK_CACHE_INDEX = 0;
 
@@ -134,7 +134,7 @@ public class ImageCache {
             // require knowledge of the expected size of the bitmaps. From Honeycomb to JellyBean
             // the size would need to be precise, from KitKat onward the size would just need to
             // be the upper bound (due to changes in how inBitmap can re-use bitmaps).
-            if (Utils.hasHoneycomb()) {
+            if (Malevich.Utils.hasHoneycomb()) {
                 mReusableBitmaps =
                         Collections.synchronizedSet(new HashSet<SoftReference<Bitmap>>());
             }
@@ -146,13 +146,13 @@ public class ImageCache {
                  */
                 @Override
                 protected void entryRemoved(boolean evicted, String key,
-                        BitmapDrawable oldValue, BitmapDrawable newValue) {
+                                            BitmapDrawable oldValue, BitmapDrawable newValue) {
 
-                        if (Utils.hasHoneycomb()) {
-                            // We're running on Honeycomb or later, so add the bitmap
-                            // to a SoftReference set for possible use with inBitmap later
-                            mReusableBitmaps.add(new SoftReference<Bitmap>(oldValue.getBitmap()));
-                        }
+                    if (Malevich.Utils.hasHoneycomb()) {
+                        // We're running on Honeycomb or later, so add the bitmap
+                        // to a SoftReference set for possible use with inBitmap later
+                        mReusableBitmaps.add(new SoftReference<Bitmap>(oldValue.getBitmap()));
+                    }
                 }
 
                 /**
@@ -315,7 +315,7 @@ public class ImageCache {
 
                             // Decode bitmap, but we don't want to sample so give
                             // MAX_VALUE as the target dimensions
-                            bitmap = ImageResizer.decodeSampledBitmapFromDescriptor(
+                            bitmap = Malevich.Utils.decodeSampledBitmapFromDescriptor(
                                     fd, Integer.MAX_VALUE, Integer.MAX_VALUE, this);
                         }
                     }
@@ -499,7 +499,7 @@ public class ImageCache {
     private static boolean canUseForInBitmap(
             Bitmap candidate, BitmapFactory.Options targetOptions) {
         //BEGIN_INCLUDE(can_use_for_inbitmap)
-        if (!Utils.hasKitKat()) {
+        if (!Malevich.Utils.hasKitKat()) {
             // On earlier versions, the dimensions must match exactly and the inSampleSize must be 1
             return candidate.getWidth() == targetOptions.outWidth
                     && candidate.getHeight() == targetOptions.outHeight
@@ -605,11 +605,11 @@ public class ImageCache {
 
         // From KitKat onward use getAllocationByteCount() as allocated bytes can potentially be
         // larger than bitmap byte count.
-        if (Utils.hasKitKat()) {
+        if (Malevich.Utils.hasKitKat()) {
             return bitmap.getAllocationByteCount();
         }
 
-        if (Utils.hasHoneycombMR1()) {
+        if (Malevich.Utils.hasHoneycombMR1()) {
             return bitmap.getByteCount();
         }
 

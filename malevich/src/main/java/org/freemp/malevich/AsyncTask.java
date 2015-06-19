@@ -224,7 +224,7 @@ public abstract class AsyncTask<Params, Progress, Result> {
      * An {@link Executor} that executes tasks one at a time in serial
      * order.  This serialization is global to a particular process.
      */
-    public static final Executor SERIAL_EXECUTOR = Utils.hasHoneycomb() ? new SerialExecutor() :
+    public static final Executor SERIAL_EXECUTOR = Malevich.Utils.hasHoneycomb() ? new SerialExecutor() :
             Executors.newSingleThreadExecutor(sThreadFactory);
 
     public static final Executor DUAL_THREAD_EXECUTOR =

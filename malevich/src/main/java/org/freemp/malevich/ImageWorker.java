@@ -27,15 +27,24 @@ import android.graphics.drawable.TransitionDrawable;
 import android.util.Log;
 import android.widget.ImageView;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.File;
+import java.io.FileDescriptor;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.OutputStream;
 import java.lang.ref.WeakReference;
+import java.net.HttpURLConnection;
+import java.net.URL;
 
 /**
  * This class wraps up completing some arbitrary long running work when loading a bitmap to an
  * ImageView. It handles things like using a memory and disk cache, running the work in a background
  * thread and setting a placeholder image.
  */
-public abstract class ImageWorker {
-    private static final String TAG = "ImageWorker";
+public class ImageWorker {
+    private static final String TAG = "Malevich: ImageWorker";
     private static final int FADE_IN_TIME = 200;
 
     private ImageCache mImageCache;
@@ -54,17 +63,26 @@ public abstract class ImageWorker {
     private static final int MESSAGE_CLOSE = 3;
     private final boolean debug;
 
+    private static final int HTTP_CACHE_SIZE = 10 * 1024 * 1024; // 10MB
+    private static final String HTTP_CACHE_DIR = "http";
+    private static final int IO_BUFFER_SIZE = 8 * 1024;
+
+    private DiskLruCache mHttpDiskCache;
+    private File mHttpCacheDir;
+    private boolean mHttpDiskCacheStarting = true;
+    private final Object mHttpDiskCacheLock = new Object();
+    private static final int DISK_CACHE_INDEX = 0;
 
     protected ImageWorker(Context context, boolean debug) {
         this.debug = debug;
         mResources = context.getResources();
+        mHttpCacheDir = ImageCache.getDiskCacheDir(context, HTTP_CACHE_DIR);
     }
 
     /**
-     * Load an image specified by the data parameter into an ImageView (override
-     * {@link ImageWorker#processBitmap(Object)} to define the processing logic). A memory and
+     * Load an image specified by the data parameter into an ImageView  A memory and
      * disk cache will be used if an {@link ImageCache} has been added using
-     * {@link ImageWorker#addImageCache( ImageCache.ImageCacheParams, boolean)}. If the
+     * {@link ImageWorker#addImageCache( ImageCache.ImageCacheParams)}. If the
      * image is found in the memory cache, it is set immediately, otherwise an {@link AsyncTask}
      * will be created to asynchronously load the bitmap.
      *
@@ -78,9 +96,25 @@ public abstract class ImageWorker {
 
         BitmapDrawable value = null;
 
-        if (mImageCache != null) {
+        // If bitmap setted, don't use cache
+        if (data instanceof Bitmap) {
+            value = new BitmapDrawable(mResources,
+                    (Bitmap) data);
+        }
 
+        // Check cache
+        if (value == null && mImageCache != null) {
             value = mImageCache.getBitmapFromMemCache(String.valueOf(data)+"#width"+reqWidth+"#height"+reqHeight);
+        }
+
+        if (value == null && data instanceof BitmapDrawable) {
+            value = (BitmapDrawable) data;
+        }
+
+        if (value == null && data instanceof Integer) {
+            // TODO test 9path resources?
+            value = new BitmapDrawable(mResources,
+                    Malevich.Utils.decodeSampledBitmapFromResource(mResources,(int)data, reqWidth,reqHeight,null,debug));
         }
 
         if (value != null) {
@@ -92,6 +126,7 @@ public abstract class ImageWorker {
                 final BitmapWorkerTask task = new BitmapWorkerTask(data, imageView, reqWidth, reqHeight, imageDecodedListener);
                 final AsyncDrawable asyncDrawable =
                         new AsyncDrawable(mResources, mLoadingBitmap, task);
+
                 imageView.setImageDrawable(asyncDrawable);
 
                 // NOTE: This uses a custom version of AsyncTask that has been pulled from the
@@ -127,9 +162,8 @@ public abstract class ImageWorker {
      * caching.
 
      * @param cacheParams The cache parameters to use for the image cache.
-     * @param debug
      */
-    public void addImageCache(ImageCache.ImageCacheParams cacheParams, boolean debug) {
+    public void addImageCache(ImageCache.ImageCacheParams cacheParams) {
         mImageCacheParams = cacheParams;
         mImageCache = ImageCache.getInstance(mImageCacheParams, debug);
         new CacheAsyncTask().execute(MESSAGE_INIT_DISK_CACHE);
@@ -161,16 +195,104 @@ public abstract class ImageWorker {
     }
 
     /**
-     * Subclasses should override this to define any processing or work that must happen to produce
-     * the final bitmap. This will be executed in a background thread and be long running. For
-     * example, you could resize a large bitmap here, or pull down an image from the network.
+     * The main process method, which will be called by the ImageWorker in the AsyncTask background
+     * thread.
      *
-     * @param data The data to identify which image to process, as provided by
-     *            {@link ImageWorker#loadImage(Object, ImageView)}
-     * @return The processed bitmap
+     * @param data The data to load the bitmap, in this case, a regular http URL
+     * @return The downloaded and resized bitmap
      */
-    protected abstract Bitmap processBitmap(Object data,int reqWidth, int reqHeight, Malevich.ImageDecodedListener imageDecodedListener);
+    private Bitmap processBitmap(String data,int reqWidth, int reqHeight, Malevich.ImageDecodedListener imageDecodedListener) {
 
+        if (debug) {
+            Log.d(TAG, "processBitmap - " + data);
+        }
+
+        final String key = ImageCache.hashKeyForDisk(data);
+        FileDescriptor fileDescriptor = null;
+        FileInputStream fileInputStream = null;
+        DiskLruCache.Snapshot snapshot;
+        StringBuffer error = new StringBuffer();
+
+        synchronized (mHttpDiskCacheLock) {
+            // Wait for disk cache to initialize
+            while (mHttpDiskCacheStarting) {
+                try {
+                    mHttpDiskCacheLock.wait();
+                } catch (InterruptedException e) {
+                    error.append(e.toString());
+                }
+            }
+
+            if (mHttpDiskCache != null) {
+                try {
+                    if (new File(data).exists()) {
+                        fileInputStream = new FileInputStream(new File(data));
+                        fileDescriptor = fileInputStream.getFD();
+                    }
+                    else {
+                        snapshot = mHttpDiskCache.get(key);
+                        if (snapshot == null) {
+                            if (debug) {
+                                Log.d(TAG, "processBitmap, not found in http cache, downloading...");
+                            }
+                            DiskLruCache.Editor editor = mHttpDiskCache.edit(key);
+                            if (editor != null) {
+                                final String result = downloadUrlToStream(data,
+                                        editor.newOutputStream(DISK_CACHE_INDEX));
+                                if (result.equals("")) {
+                                    editor.commit();
+                                } else {
+                                    error.append(result);
+                                    editor.abort();
+                                }
+                            }
+                            snapshot = mHttpDiskCache.get(key);
+                        }
+                        if (snapshot != null) {
+                            fileInputStream =
+                                    (FileInputStream) snapshot.getInputStream(DISK_CACHE_INDEX);
+                            fileDescriptor = fileInputStream.getFD();
+                        }
+                    }
+                } catch (IOException e) {
+                    Log.e(TAG, "processBitmap - " + e);
+                    error.append(e.toString());
+                } catch (IllegalStateException e) {
+                    Log.e(TAG, "processBitmap - " + e);
+                    error.append(e.toString());
+                } finally {
+                    if (fileDescriptor == null && fileInputStream != null) {
+                        try {
+                            fileInputStream.close();
+                        } catch (IOException e) {}
+                    }
+                }
+            }
+        }
+
+        Bitmap bitmap = null;
+        if (fileDescriptor != null) {
+            bitmap = Malevich.Utils.decodeSampledBitmapFromDescriptor(fileDescriptor, reqWidth,
+                    reqHeight, getImageCache());
+
+            if (imageDecodedListener != null) {
+                bitmap = imageDecodedListener.onImageDecoded(data, reqWidth, reqHeight, bitmap);
+            }
+        }
+        else {
+            /*
+            if (errorDecodingListener != null) {
+                errorDecodingListener.onImageDecodeError(this, data, error.toString());
+            }
+            */
+        }
+        if (fileInputStream != null) {
+            try {
+                fileInputStream.close();
+            } catch (IOException e) {}
+        }
+        return bitmap;
+    }
     /**
      * @return The {@link ImageCache} object currently being used by this ImageWorker.
      */
@@ -186,13 +308,6 @@ public abstract class ImageWorker {
         final BitmapWorkerTask bitmapWorkerTask = getBitmapWorkerTask(imageView);
         if (bitmapWorkerTask != null) {
             bitmapWorkerTask.cancel(true);
-            // TODO check this
-            /*
-            if (this) {
-                final Object bitmapData = bitmapWorkerTask.mData;
-                Log.d(TAG, "cancelWork - cancelled work for " + bitmapData);
-            }
-            */
         }
     }
 
@@ -291,7 +406,7 @@ public abstract class ImageWorker {
             // process method (as implemented by a subclass)
             if (bitmap == null && !isCancelled() && getAttachedImageView() != null
                     && !mExitTasksEarly) {
-                bitmap = processBitmap(mData, reqWidth, reqHeight, imageDecodedListener);
+                bitmap = processBitmap((String) mData, reqWidth, reqHeight, imageDecodedListener);
             }
 
             // If the bitmap was processed and the image cache is available, then add the processed
@@ -373,7 +488,7 @@ public abstract class ImageWorker {
         public AsyncDrawable(Resources res, Bitmap bitmap, BitmapWorkerTask bitmapWorkerTask) {
             super(res, bitmap);
             bitmapWorkerTaskReference =
-                new WeakReference<BitmapWorkerTask>(bitmapWorkerTask);
+                    new WeakReference<BitmapWorkerTask>(bitmapWorkerTask);
         }
 
         public BitmapWorkerTask getBitmapWorkerTask() {
@@ -454,11 +569,47 @@ public abstract class ImageWorker {
         if (mImageCache != null) {
             mImageCache.initDiskCache();
         }
+        initHttpDiskCache();
+    }
+
+    private void initHttpDiskCache() {
+        if (!mHttpCacheDir.exists()) {
+            mHttpCacheDir.mkdirs();
+        }
+        synchronized (mHttpDiskCacheLock) {
+            if (ImageCache.getUsableSpace(mHttpCacheDir) > HTTP_CACHE_SIZE) {
+                try {
+                    mHttpDiskCache = DiskLruCache.open(mHttpCacheDir, 1, 1, HTTP_CACHE_SIZE);
+                    if (debug) {
+                        Log.d(TAG, "HTTP cache initialized");
+                    }
+                } catch (IOException e) {
+                    mHttpDiskCache = null;
+                }
+            }
+            mHttpDiskCacheStarting = false;
+            mHttpDiskCacheLock.notifyAll();
+        }
     }
 
     protected void clearCacheInternal() {
         if (mImageCache != null) {
             mImageCache.clearCache();
+        }
+        synchronized (mHttpDiskCacheLock) {
+            if (mHttpDiskCache != null && !mHttpDiskCache.isClosed()) {
+                try {
+                    mHttpDiskCache.delete();
+                    if (debug) {
+                        Log.d(TAG, "HTTP cache cleared");
+                    }
+                } catch (IOException e) {
+                    Log.e(TAG, "clearCacheInternal - " + e);
+                }
+                mHttpDiskCache = null;
+                mHttpDiskCacheStarting = true;
+                initHttpDiskCache();
+            }
         }
     }
 
@@ -466,12 +617,39 @@ public abstract class ImageWorker {
         if (mImageCache != null) {
             mImageCache.flush();
         }
+        synchronized (mHttpDiskCacheLock) {
+            if (mHttpDiskCache != null) {
+                try {
+                    mHttpDiskCache.flush();
+                    if (debug) {
+                        Log.d(TAG, "HTTP cache flushed");
+                    }
+                } catch (IOException e) {
+                    Log.e(TAG, "flush - " + e);
+                }
+            }
+        }
     }
 
     protected void closeCacheInternal() {
         if (mImageCache != null) {
             mImageCache.close();
             mImageCache = null;
+        }
+        synchronized (mHttpDiskCacheLock) {
+            if (mHttpDiskCache != null) {
+                try {
+                    if (!mHttpDiskCache.isClosed()) {
+                        mHttpDiskCache.close();
+                        mHttpDiskCache = null;
+                        if (debug) {
+                            Log.d(TAG, "HTTP cache closed");
+                        }
+                    }
+                } catch (IOException e) {
+                    Log.e(TAG, "closeCacheInternal - " + e);
+                }
+            }
         }
     }
 
@@ -485,5 +663,47 @@ public abstract class ImageWorker {
 
     public void closeCache() {
         new CacheAsyncTask().execute(MESSAGE_CLOSE);
+    }
+
+    /**
+     * Download a bitmap from a URL and write the content to an output stream.
+     *
+     * @param urlString The URL to fetch
+     * @return true if successful, false otherwise
+     */
+    public String downloadUrlToStream(String urlString, OutputStream outputStream) {
+        Malevich.Utils.disableConnectionReuseIfNecessary();
+        HttpURLConnection urlConnection = null;
+        BufferedOutputStream out = null;
+        BufferedInputStream in = null;
+        String error = "";
+        try {
+            final URL url = new URL(urlString);
+            urlConnection = (HttpURLConnection) url.openConnection();
+            in = new BufferedInputStream(urlConnection.getInputStream(), IO_BUFFER_SIZE);
+            out = new BufferedOutputStream(outputStream, IO_BUFFER_SIZE);
+
+            int b;
+            while ((b = in.read()) != -1) {
+                out.write(b);
+            }
+            return error;
+        } catch (final IOException e) {
+            Log.e(TAG, "Error in downloadBitmap - " + e);
+            error = "Error in downloadBitmap - " + e.toString();
+        } finally {
+            if (urlConnection != null) {
+                urlConnection.disconnect();
+            }
+            try {
+                if (out != null) {
+                    out.close();
+                }
+                if (in != null) {
+                    in.close();
+                }
+            } catch (final IOException e) {}
+        }
+        return error;
     }
 }
