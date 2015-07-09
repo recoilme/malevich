@@ -20,7 +20,7 @@ Malevich malevich = new Malevich.Builder(this).build();
 malevich.load(mImageUrl).into(mImageView);
 
 ```
-### Whats all!
+### Thats all!
 
 Advansed usage:
 --------------
