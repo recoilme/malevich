@@ -92,7 +92,7 @@ mGridView.setOnScrollListener(new AbsListView.OnScrollListener() {
         });
 ```
 
-Cansel and pausing tasks
+Canсel and pausing tasks
 -----------------
 ```
     @Override
